@@ -323,9 +323,13 @@ main.py: train(...)
         -> features_to_xarray(X)
         -> MultistepModel.fit_multi(y_xr, X_xr)
             -> _build_lag_matrix_xr(y, n_lags)
-            -> one_step_model.fit(X_np, y_np)
-                -> ResidualBootstrapModel.fit(X_np, y_np)
+            -> _infer_time_granularity(times)
+            -> residual_context = [(loc, period_token), ...]  # one per training row
+            -> one_step_model.fit(X_np, y_np, residual_context=masked_context)
+                -> ResidualBootstrapModel.fit(X_np, y_np, residual_context)
                     -> RandomForestRegressor.fit(X_np, y_np)
+                    -> residuals = y_np - RF.predict(X_np)
+                    -> bucket residuals by location and (location, period_token)
 ```
 
 This is the most important sequence in the whole project.
@@ -611,19 +615,19 @@ This is a final safety filter.
 
 ---
 
-## 14. `ResidualBootstrapModel.fit(X, y)`
+## 14. `ResidualBootstrapModel.fit(X, y, residual_context)`
 
 Now training reaches the one-step probabilistic wrapper.
 
-The code is:
+The full signature is:
 
 ```python
-self._regressor.fit(X, y)
-predictions = self._regressor.predict(X)
-self._residuals = y - predictions
+def fit(self, X, y, residual_context=None):
 ```
 
-This method does three things, in strict order.
+where `residual_context` is an optional list of `(location, period_token)` tuples, one per training row.
+
+This method does four things, in strict order.
 
 ### Step 1. Train the random forest
 
@@ -656,8 +660,25 @@ self._residuals = y - predictions
 A residual is:
 
 $$
-	ext{residual} = y_{\text{true}} - y_{\text{predicted}}
+\text{residual} = y_{\text{true}} - y_{\text{predicted}}
 $$
+
+### Step 4. Bucket residuals by context
+
+If `residual_context` is provided, the residuals are stored in two additional dictionaries:
+
+```python
+self._residuals_by_location         # {location: array of residuals}
+self._residuals_by_location_period  # {(location, period_token): array of residuals}
+```
+
+A `period_token` is a two-character string like `"03"` (March) or `"W12"` (week 12). It comes from the `time_period` column of the training data. Monthly data produces tokens like `"03"`; weekly data produces tokens like `"W12"`.
+
+This bucketing allows the model to answer the question:
+
+> When the model makes an error in January for location X, does that error look different from its errors in July?
+
+If yes, seasonal residual sampling will produce better-calibrated uncertainty.
 
 ### Why store residuals?
 
@@ -668,10 +689,74 @@ The residuals capture typical errors the model made during training.
 Later, when predicting, the code will say:
 
 - the forest thinks the next value is 20,
-- historically the model often misses by values like -3, +1, +5, -2,
-- so sample one of those errors and add it.
+- historically, in this location and this month, the model missed by values like -3, +1, +5, -2,
+- so sample one of those context-matched errors and add it.
 
-That is the bootstrap uncertainty mechanism.
+That is the context-aware bootstrap uncertainty mechanism.
+
+---
+
+## 14b. Period Tokens and Seasonal Residual Buckets
+
+The concept of a period token is central to the new architecture.
+
+### What is a period token?
+
+A period token is the non-year part of a time period string.
+
+- For monthly data `"2024-03"`, the token is `"03"`.
+- For weekly data `"2024-W12"`, the token is `"W12"`.
+
+### How is the granularity detected?
+
+The function `_infer_time_granularity(times)` looks at the median gap between consecutive timestamps in the training data. If the gap is 10 days or less, it assumes weekly. Otherwise it assumes monthly.
+
+This runs automatically during `fit_multi`. The user does not need to set it.
+
+### Where does the context come from during training?
+
+In `MultistepModel.fit_multi`, after building the lag matrix and stacking all `(location, time)` pairs into a flat training table, the code computes:
+
+```python
+residual_context = [
+    (str(loc), _period_token_from_datetime(time_val, time_granularity))
+    for loc, time_val in sample_index
+]
+```
+
+This creates one `(location, period_token)` tuple per training row, in the exact same order as `X_np` and `y_np`. After dropping NaN rows with the `mask`, the corresponding context entries are also filtered:
+
+```python
+masked_context = [ctx for ctx, keep in zip(residual_context, mask) if keep]
+```
+
+Then `one_step_model.fit(X_np[mask], y_np[mask], residual_context=masked_context)` is called.
+
+### Where does the context come from during prediction?
+
+In `DataFrameMultistepModel.predict`, after the future DataFrame is sliced, the code computes:
+
+```python
+future_tokens = {
+    str(loc): [
+        _period_token_from_string(tp)
+        for tp in group["time_period"].astype(str).tolist()
+    ]
+    for loc, group in future_df.groupby("location", sort=False)
+}
+```
+
+These period tokens for each future forecast step are then passed through:
+
+```
+DataFrameMultistepModel.predict
+    -> MultistepModel.predict_multi(step_period_tokens=future_tokens)
+        -> MultistepModel.predict_proba(location=loc, step_period_tokens=[...])
+            -> MultistepDistribution(location=loc, step_period_tokens=[...])
+                -> dist.sample(1, context_by_row=[(location, period_token)])
+```
+
+So at every AR rollout step, the residual is sampled from the bucket that matches the location and season of the forecast target.
 
 ---
 
@@ -934,7 +1019,12 @@ Then the code does:
 
 ```python
 dist = self._model.predict_proba(features.values)
-step_samples = xr.DataArray(dist.sample(1)[0], dims=["trajectory"])
+context = None
+if self._location is not None and step < len(self._step_period_tokens):
+    context = [(self._location, self._step_period_tokens[step])] * n
+
+sampled = dist.sample(1, context_by_row=context)
+step_samples = xr.DataArray(sampled[0], dims=["trajectory"])
 ```
 
 ### What happens here?
@@ -946,22 +1036,25 @@ This calls `ResidualBootstrapModel.predict_proba(...)`.
 That method:
 
 1. asks the fitted forest for point predictions,
-2. wraps them together with stored residuals,
+2. wraps them together with stored residuals (global pool and context buckets),
 3. returns a `ResidualDistribution`.
 
-#### `dist.sample(1)`
+#### `dist.sample(1, context_by_row=context)`
 
 This draws one sampled next value per trajectory.
 
-Inside `ResidualDistribution.sample(1)`:
+If `context` is provided (a list of `(location, period_token)` tuples), then for each trajectory the residual is drawn from the bucket that matches the location and the current forecast step's calendar period.
 
-1. one training residual is sampled for each trajectory,
-2. that residual is added to the forest prediction,
-3. the result is clipped to be non-negative.
+Inside `ResidualDistribution.sample(1, context_by_row=context)`:
+
+1. for each row (trajectory), the pool is selected via `_pool_for_context(location, period_token)`,
+2. one residual is drawn from that pool,
+3. it is added to the forest point prediction,
+4. the result is clipped to be non-negative.
 
 So after step 1, the 200 trajectories are no longer identical.
 
-They diverge.
+They diverge — and the direction of divergence reflects the seasonal error pattern of this location.
 
 ---
 
@@ -1123,19 +1216,20 @@ By itself it is deterministic and one-step only.
 Role:
 
 - wraps the forest,
-- stores training residuals,
+- stores training residuals globally and in `(location, period_token)` buckets,
 - exposes `predict_proba`.
 
-It converts a deterministic regressor into a probabilistic one-step model.
+It converts a deterministic regressor into a context-aware probabilistic one-step model.
 
 ### `ResidualDistribution`
 
 Role:
 
-- holds point predictions and residuals,
-- can sample possible future values.
+- holds point predictions and residuals (global + location-specific + period-specific buckets),
+- selects the most specific residual pool for each prediction row via `_pool_for_context`,
+- can sample context-matched noisy predictions on demand.
 
-It is the source of one-step uncertainty.
+It is the source of one-step uncertainty, now seasonally calibrated.
 
 ### `DataFrameMultistepModel`
 
@@ -1162,9 +1256,10 @@ It is the main orchestration layer for recursive modeling.
 Role:
 
 - recursively simulates multiple future trajectories,
-- updates lag windows after each sampled step.
+- updates lag windows after each sampled step,
+- passes location and per-step period tokens to the one-step sampler so residuals are drawn from the matching seasonal bucket.
 
-It is the source of multi-step uncertainty propagation.
+It is the source of multi-step uncertainty propagation, with season-aware residual selection at every step.
 
 ### `Distribution` protocol
 
@@ -1222,9 +1317,12 @@ Training, chronologically:
 8. build 6 lagged target features,
 9. combine exogenous features and lagged target features,
 10. flatten all `(location, time)` pairs into one training table,
-11. fit the random forest,
-12. compute and store training residuals,
-13. pickle the whole forecaster.
+11. detect time granularity (monthly or weekly) from training time periods,
+12. compute a `(location, period_token)` context tuple for every training row,
+13. fit the random forest,
+14. compute training residuals,
+15. bucket residuals by location and by `(location, period_token)`,
+16. pickle the whole forecaster (including all residual buckets).
 
 ---
 
@@ -1236,17 +1334,19 @@ Prediction, chronologically:
 2. load historical observations,
 3. load future known features,
 4. keep the last 6 observed target values per location,
-5. keep future exogenous features per location,
-6. for each location, create 200 identical lag windows,
-7. at each forecast step:
-8. build features from future exogenous values plus current lag window,
-9. get random-forest point predictions,
-10. add one sampled residual per trajectory,
-11. clip negatives to zero,
-12. append sampled values to the lag window,
-13. repeat until horizon is complete,
-14. return 200 trajectories per location,
-15. save them as CSV.
+5. compute period tokens for each future forecast step (e.g. `["03", "04", "05", "06", "07", "08"]`),
+6. keep future exogenous features per location,
+7. for each location, create 200 identical lag windows,
+8. at each forecast step `k`:
+9. build features from future exogenous values at step `k` plus current lag window,
+10. get random-forest point predictions,
+11. select the residual bucket matching `(location, period_token[k])`, falling back as needed,
+12. add one sampled residual per trajectory from that bucket,
+13. clip negatives to zero,
+14. append sampled values to the lag window,
+15. repeat until horizon is complete,
+16. return 200 trajectories per location,
+17. save them as CSV.
 
 ---
 
@@ -1314,7 +1414,7 @@ The difference between observed value and model prediction.
 
 ### Residual bootstrap
 
-Generate uncertainty by resampling stored model errors.
+Generate uncertainty by resampling stored training residuals. Residuals are bucketed by `(location, period_token)` and matched to the location and season of the forecast target, falling back to broader pools when a specific bucket is too small.
 
 ### Recursive forecasting
 
@@ -1375,15 +1475,21 @@ DataFrameMultistepModel.fit(X, y)
           │       → flat (N_total_samples, n_features+6) array
           │       (pooling all locations together)
           │
-          ├─► drop NaN rows
+          ├─► _infer_time_granularity(times) → "month" or "week"
+          ├─► residual_context = [(loc, period_token), ...] per training row
+          ├─► drop NaN rows (filter mask applied to context too)
           │
-          └─► ResidualBootstrapModel.fit(X_np, y_np)
+          └─► ResidualBootstrapModel.fit(X_np, y_np, residual_context)
                   │
                   ├─► RandomForestRegressor.fit(X_np, y_np)
                   │       trains the RF on all (location, time) pairs
                   │
-                  └─► residuals = y_np - RF.predict(X_np)
-                          stores in-sample residuals for noise sampling
+                  ├─► residuals = y_np - RF.predict(X_np)
+                  │
+                  └─► bucket residuals:
+                          _residuals                         (global)
+                          _residuals_by_location             {loc: array}
+                          _residuals_by_location_period      {(loc, token): array}
 ```
 
 ---
@@ -1402,19 +1508,25 @@ DataFrameMultistepModel.predict(y_historic, X_combined, n_steps=6, n_samples=200
   ├─► features_to_xarray(X_combined) → X_xr (location, T_hist+n_steps, n_features)
   ├─► X_future = X_xr[:, -n_steps:] → (location, n_steps, n_features)
   │
-  └─► MultistepModel.predict_multi(previous_y, n_steps=6, n_samples=200, X_future)
+  ├─► future_tokens = {loc: ["03", "04", ...]} per location (period tokens for each future step)
+  │
+  └─► MultistepModel.predict_multi(previous_y, n_steps=6, n_samples=200, X_future,
+                                   step_period_tokens=future_tokens)
           │
           └─► for each location:
-                  MultistepDistribution.sample(200)
+                  MultistepDistribution(location=loc, step_period_tokens=["03",...])
+                  .sample(200)
                       │
                       └─► AR loop (6 steps):
                               step 1: features = [climate_step1 | lag_1..lag_6]
-                                      → RF point pred + sample 1 residual × 200 trajectories
+                                      context = [(loc, "03")] × 200 trajectories
+                                      → RF point pred + sample 1 residual from (loc,"03") bucket
                                       → 200 sampled "step 1" values
                               step 2: features = [climate_step2 | sample_step1 | lag_1..lag_5]
+                                      context = [(loc, "04")] × 200
                                       → 200 sampled "step 2" values (diverging)
                               ...
-                              step 6: 200 trajectories fully diverged
+                              step 6: 200 trajectories fully diverged, residuals from (loc,"08")
                       returns (200, 6) array
           stacked → DataArray (location, trajectory=200, step=6)
           │
@@ -1430,8 +1542,8 @@ DataFrameMultistepModel.predict(y_historic, X_combined, n_steps=6, n_samples=200
 ### Autoregression (AR)
 The model uses `N_TARGET_LAGS=6` past disease counts as predictors for the next value. This lets it capture seasonality and epidemic dynamics without explicitly modelling them — the lag structure implicitly encodes time-series patterns.
 
-### Residual Bootstrap
-After training, the model stores `residuals = y_true - y_pred` for all training points. At prediction time, uncertainty is quantified by adding randomly drawn training residuals to the point forecast. This is a non-parametric bootstrap — no distributional assumption (Gaussian etc.) is imposed.
+### Residual Bootstrap (Context-Aware)
+After training, the model stores `residuals = y_true - y_pred` for all training points in three structures: a global pool, a pool per location, and a pool per `(location, period_token)` pair. At prediction time, the most specific matching bucket is used (with fallback to more general pools when the specific bucket is too small). This is a non-parametric bootstrap — no distributional assumption (Gaussian etc.) is imposed. The seasonal bucketing preserves the empirical structure of model errors within each calendar period, which produces better-calibrated uncertainty over horizons that span different seasons.
 
 ### Recursive / Rollout Forecasting
 When forecasting `h` steps ahead, the model only predicts one step at a time, then feeds that prediction back in as a lag feature. This means:
